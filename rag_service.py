@@ -7,16 +7,16 @@ Chunking      : Semantic Chunking  (LlamaIndex SemanticSplitterNodeParser)
 Embedding     : BGE-M3  (text)  +  nomic-embed-vision-v1.5  (images)
 Retrieval     : Hybrid Search (dense + BM25 sparse) + BAAI/bge-reranker-v2-m3
 LLM           : meta-llama/Llama-3-8B-Instruct via Ollama
-Vector Store  : Redis  (port 6379)   DB 9 = dense vectors   DB 10 = BM25   (DB 0–8 reserved for cache/chatbot/meeting)
+Vector Store  : In-memory store  DB 9 = dense vectors   DB 10 = BM25
 S3 Source     : s3://chakorahub-rag-s3/ChakoraHub-Org-Docs/
 Port          : 7900
 
 Install:
   pip install "llama-index-core>=0.10" llama-index-embeddings-huggingface
-  pip install llama-index-vector-stores-redis llama-index-postprocessor-flag-embedding-reranker
+    pip install llama-index-postprocessor-flag-embedding-reranker
   pip install llama-index-readers-s3 llama-index-readers-file
   pip install FlagEmbedding sentence-transformers transformers torch
-  pip install fastapi uvicorn boto3 redis pillow pypdf python-docx
+    pip install fastapi uvicorn boto3 pillow pypdf python-docx
   pip install rank-bm25 httpx numpy python-dotenv
 
 Run:
@@ -47,7 +47,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import boto3
 import httpx
 import numpy as np
-import redis
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -76,11 +75,11 @@ AWS_REGION = os.getenv("AWS_REGION",     "eu-north-1")
 TRANSCRIPT_EVENT_BUCKET = os.getenv("TRANSCRIPT_BUCKET", "chakorahub-meeting-s3")
 TRANSCRIPT_EVENT_PREFIX = os.getenv("TRANSCRIPT_PREFIX", "transcripts/")
 
-REDIS_HOST     = os.getenv("REDIS_HOST",         "localhost")
-REDIS_RAG_PORT = int(os.getenv("REDIS_RAG_PORT", "6379"))
-REDIS_RAG_PASS = os.getenv("REDIS_RAG_PASSWORD", None)
-REDIS_VEC_DB   = int(os.getenv("REDIS_VECTOR_DB", "9"))   # dense vectors + metadata  (DB 0–8 reserved for redis_service)
-REDIS_BM25_DB  = int(os.getenv("REDIS_BM25_DB",   "10"))  # BM25 inverted index
+CACHE_HOST     = os.getenv("CACHE_HOST",         "localhost")
+CACHE_RAG_PORT = int(os.getenv("CACHE_RAG_PORT", "6379"))
+CACHE_RAG_PASS = os.getenv("CACHE_RAG_PASSWORD", None)
+CACHE_VEC_DB   = int(os.getenv("CACHE_VECTOR_DB", "9"))
+CACHE_BM25_DB  = int(os.getenv("CACHE_BM25_DB",   "10"))
 
 TEXT_EMBED_MODEL  = os.getenv("TEXT_EMBED_MODEL",  "BAAI/bge-m3")
 IMAGE_EMBED_MODEL = os.getenv("IMAGE_EMBED_MODEL", "nomic-ai/nomic-embed-vision-v1.5")
@@ -113,7 +112,7 @@ DEBUG_MEETING_COMPLETED_BOOKING_ID = os.getenv(
     "275a3ee2-5e19-4205-b784-414e06c32c18",
 ).strip()
 
-# Redis key namespaces
+# Cache key namespaces
 CHUNK_PFX      = "rag:chunk:"
 BM25_TERM_PFX  = "rag:bm25:term:"
 BM25_META_KEY  = "rag:bm25:meta"
@@ -143,25 +142,126 @@ app.add_middleware(
 )
 
 # ═══════════════════════════════════════════════════════════════
-# REDIS CLIENTS
+# CACHE CLIENTS
 # ═══════════════════════════════════════════════════════════════
 
-def _make_redis(db: int, decode: bool = False) -> redis.Redis:
-    return redis.Redis(
-        host=REDIS_HOST, port=REDIS_RAG_PORT,
-        db=db, password=REDIS_RAG_PASS,
-        decode_responses=decode,
-    )
+class _InMemoryCache:
+    def __init__(self, decode_responses: bool = False):
+        self.decode_responses = decode_responses
+        self._kv: Dict[str, Any] = {}
+        self._sets: Dict[str, set] = {}
+        self._zsets: Dict[str, Dict[str, float]] = {}
 
-redis_vec      = _make_redis(REDIS_VEC_DB,  decode=False)   # binary, for vector bytes
-redis_bm25_str = _make_redis(REDIS_BM25_DB, decode=True)    # text, for BM25 index
+    def ping(self):
+        return True
 
-for _c, _l in [(redis_vec, "Vec-DB"), (redis_bm25_str, "BM25-DB")]:
+    def exists(self, key: str):
+        return 1 if key in self._kv else 0
+
+    def close(self):
+        return None
+
+    def _as_key(self, key: Any) -> str:
+        return key.decode("utf-8") if isinstance(key, (bytes, bytearray)) else str(key)
+
+    def hset(self, key: str, mapping: Optional[Dict[str, Any]] = None, *args):
+        k = self._as_key(key)
+        if mapping is None and len(args) == 2:
+            field, value = args
+            mapping = {field: value}
+        current = self._kv.get(k)
+        if not isinstance(current, dict):
+            current = {}
+        for mk, mv in (mapping or {}).items():
+            current[self._as_key(mk)] = mv
+        self._kv[k] = current
+        return 1
+
+    def hget(self, key: str, field: str):
+        current = self._kv.get(self._as_key(key), {})
+        if not isinstance(current, dict):
+            return None
+        return current.get(self._as_key(field))
+
+    def hgetall(self, key: str):
+        current = self._kv.get(self._as_key(key), {})
+        return dict(current) if isinstance(current, dict) else {}
+
+    def hdel(self, key: str, field: str):
+        current = self._kv.get(self._as_key(key), {})
+        if isinstance(current, dict):
+            current.pop(self._as_key(field), None)
+        return 1
+
+    def sadd(self, key: str, *values):
+        k = self._as_key(key)
+        s = self._sets.setdefault(k, set())
+        for v in values:
+            s.add(self._as_key(v))
+        return len(values)
+
+    def srem(self, key: str, *values):
+        s = self._sets.get(self._as_key(key), set())
+        removed = 0
+        for v in values:
+            vv = self._as_key(v)
+            if vv in s:
+                s.remove(vv)
+                removed += 1
+        return removed
+
+    def scard(self, key: str):
+        return len(self._sets.get(self._as_key(key), set()))
+
+    def zadd(self, key: str, mapping: Dict[str, float]):
+        z = self._zsets.setdefault(self._as_key(key), {})
+        for mk, mv in mapping.items():
+            z[self._as_key(mk)] = float(mv)
+        return len(mapping)
+
+    def zrangebyscore(self, key: str, min_score: Any, max_score: Any, withscores: bool = False):
+        z = self._zsets.get(self._as_key(key), {})
+        min_v = float("-inf") if min_score == "-inf" else float(min_score)
+        max_v = float("inf") if max_score == "+inf" else float(max_score)
+        items = [(k, v) for k, v in z.items() if min_v <= float(v) <= max_v]
+        items.sort(key=lambda x: x[1])
+        return items if withscores else [k for k, _ in items]
+
+    def delete(self, key: Any):
+        k = self._as_key(key)
+        self._kv.pop(k, None)
+        self._sets.pop(k, None)
+        self._zsets.pop(k, None)
+        return 1
+
+    def scan_iter(self, pattern: str):
+        regex = re.compile("^" + re.escape(pattern).replace("\\*", ".*") + "$")
+        keys = set(self._kv.keys()) | set(self._sets.keys()) | set(self._zsets.keys())
+        for key in keys:
+            if regex.match(key):
+                yield key
+
+    def ft(self, _idx_name: str):
+        class _FT:
+            def info(self):
+                return {}
+            def create_index(self, *args, **kwargs):
+                return None
+        return _FT()
+
+def _make_cache(db: int, decode: bool = False):
+    _ = db
+    return _InMemoryCache(decode_responses=decode)
+
+cache_vec      = _make_cache(CACHE_VEC_DB,  decode=False)   # binary, for vector bytes
+cache_bm25_str = _make_cache(CACHE_BM25_DB, decode=True)    # text, for BM25 index
+
+for _c, _l in [(cache_vec, "Vec-DB"), (cache_bm25_str, "BM25-DB")]:
     try:
         _c.ping()
-        print(f"✅ Redis {_l} connected  ({REDIS_HOST}:{REDIS_RAG_PORT})")
+        print(f"✅ In-memory store active for {_l} (Cache decoupled)")
     except Exception as _e:
-        print(f"❌ Redis {_l} connection failed: {_e}")
+        print(f"❌ In-memory store init failed for {_l}: {_e}")
 
 # ═══════════════════════════════════════════════════════════════
 # KAFKA HELPERS
@@ -673,7 +773,7 @@ def download_s3_bytes(key: str) -> bytes:
 
 def _has_existing_doc_index() -> bool:
     try:
-        return redis_vec.scard(DOC_IDX_KEY) > 0 or redis_vec.exists(ETAG_KEY) == 1
+        return cache_vec.scard(DOC_IDX_KEY) > 0 or cache_vec.exists(ETAG_KEY) == 1
     except Exception:
         return False
 
@@ -751,11 +851,11 @@ def extract_images_from_pdf(payload: bytes) -> List[bytes]:
 
 
 # ═══════════════════════════════════════════════════════════════
-# REDIS VECTOR STORE HELPERS
+# CACHE VECTOR STORE HELPERS
 # ═══════════════════════════════════════════════════════════════
 
 def _vec_to_bytes(vec: np.ndarray) -> bytes:
-    """Pack float32 ndarray → little-endian bytes (Redis-storable)."""
+    """Pack float32 ndarray → little-endian bytes (Cache-storable)."""
     return struct.pack(f"<{len(vec)}f", *vec.astype(np.float32))
 
 
@@ -763,51 +863,9 @@ def _bytes_to_vec(b: bytes, dim: int) -> np.ndarray:
     return np.array(struct.unpack(f"<{dim}f", b), dtype=np.float32)
 
 
-def create_redis_vector_index() -> None:
-    """
-    Create a flat HNSW vector index in Redis using raw commands if
-    redis-py's Search module is available, otherwise skip (manual HNSW
-    search will work without the index for small corpora).
-    """
-    try:
-        from redis.commands.search.field import VectorField, TextField, NumericField
-        from redis.commands.search.indexDefinition import IndexDefinition, IndexType
-        from redis.commands.search import Query as RediSearch_Query
-
-        idx_name = "rag_vec_idx"
-        try:
-            redis_vec.ft(idx_name).info()
-            print(f"ℹ️  Redis vector index '{idx_name}' already exists")
-            return
-        except Exception:
-            pass  # index doesn't exist yet — create it
-
-        schema = (
-            TextField("$.filename", as_name="filename"),
-            TextField("$.modality", as_name="modality"),
-            VectorField(
-                "$.dense_vec",
-                "HNSW",
-                {
-                    "TYPE":            "FLOAT32",
-                    "DIM":             TEXT_EMBED_DIM,
-                    "DISTANCE_METRIC": "COSINE",
-                    "M":               16,
-                    "EF_CONSTRUCTION": 200,
-                },
-                as_name="dense_vec",
-            ),
-        )
-        redis_vec.ft(idx_name).create_index(
-            schema,
-            definition=IndexDefinition(
-                prefix=[CHUNK_PFX],
-                index_type=IndexType.JSON,
-            ),
-        )
-        print(f"✅ Redis HNSW vector index '{idx_name}' created")
-    except Exception as e:
-        print(f"⚠️  Redis vector index creation skipped (will use brute-force KNN): {e}")
+def create_cache_vector_index() -> None:
+    """No-op index initializer for in-memory vector storage mode."""
+    print("ℹ️ Vector index initialization skipped (in-memory mode)")
 
 
 def store_chunk_vector(
@@ -821,9 +879,9 @@ def store_chunk_vector(
     image_caption: str = "",
     booking_id:    str = "",            
 ) -> None:
-    """Store one chunk with its dense vector in Redis hash (CHUNK_PFX + chunk_id)."""
+    """Store one chunk with its dense vector in Cache hash (CHUNK_PFX + chunk_id)."""
     key = f"{CHUNK_PFX}{chunk_id}"
-    redis_vec.hset(key, mapping={
+    cache_vec.hset(key, mapping={
         "doc_id":        doc_id,
         "text":          text.encode("utf-8"),
         "filename":      filename.encode("utf-8"),
@@ -833,27 +891,27 @@ def store_chunk_vector(
         "dense_vec":     _vec_to_bytes(dense_vec),
         "booking_id":    booking_id.encode("utf-8"),
     })
-    redis_vec.sadd(DOC_IDX_KEY, doc_id)
+    cache_vec.sadd(DOC_IDX_KEY, doc_id)
 
 
 def delete_doc_chunks(doc_id: str) -> int:
     """Delete all chunks belonging to doc_id from Vec DB and BM25 DB."""
     deleted = 0
-    for key in redis_vec.scan_iter(f"{CHUNK_PFX}*"):
-        raw = redis_vec.hget(key, "doc_id")
+    for key in cache_vec.scan_iter(f"{CHUNK_PFX}*"):
+        raw = cache_vec.hget(key, "doc_id")
         stored_id = raw.decode() if isinstance(raw, bytes) else (raw or "")
         if stored_id == doc_id:
             chunk_id = key.decode().replace(CHUNK_PFX, "") if isinstance(key, bytes) else key.replace(CHUNK_PFX, "")
-            redis_vec.delete(key)
+            cache_vec.delete(key)
             # Remove from BM25 index
-            redis_bm25_str.hdel(BM25_META_KEY, chunk_id)
+            cache_bm25_str.hdel(BM25_META_KEY, chunk_id)
             deleted += 1
-    redis_vec.srem(DOC_IDX_KEY, doc_id)
+    cache_vec.srem(DOC_IDX_KEY, doc_id)
     return deleted
 
 
 # ═══════════════════════════════════════════════════════════════
-# BM25 INVERTED INDEX  (Redis-backed sparse retrieval)
+# BM25 INVERTED INDEX  (Cache-backed sparse retrieval)
 # ═══════════════════════════════════════════════════════════════
 
 _STOPWORDS = {
@@ -880,9 +938,9 @@ def bm25_index_chunk(chunk_id: str, text: str) -> None:
     for t in tokens:
         tf[t] += 1
     doc_len = len(tokens)
-    redis_bm25_str.hset(BM25_META_KEY, chunk_id, str(doc_len))
+    cache_bm25_str.hset(BM25_META_KEY, chunk_id, str(doc_len))
     for term, count in tf.items():
-        redis_bm25_str.zadd(f"{BM25_TERM_PFX}{term}", {chunk_id: count / doc_len})
+        cache_bm25_str.zadd(f"{BM25_TERM_PFX}{term}", {chunk_id: count / doc_len})
 
 
 def bm25_search(query: str, top_k: int = HYBRID_BM25_TOP_K) -> List[Tuple[str, float]]:
@@ -896,7 +954,7 @@ def bm25_search(query: str, top_k: int = HYBRID_BM25_TOP_K) -> List[Tuple[str, f
         return []
 
     # Corpus stats
-    meta_all   = redis_bm25_str.hgetall(BM25_META_KEY)
+    meta_all   = cache_bm25_str.hgetall(BM25_META_KEY)
     if not meta_all:
         return []
     doc_lens   = {k: int(v) for k, v in meta_all.items()}
@@ -906,7 +964,7 @@ def bm25_search(query: str, top_k: int = HYBRID_BM25_TOP_K) -> List[Tuple[str, f
     candidate_scores: Dict[str, float] = defaultdict(float)
 
     for term in set(terms):
-        tf_map = redis_bm25_str.zrangebyscore(
+        tf_map = cache_bm25_str.zrangebyscore(
             f"{BM25_TERM_PFX}{term}", "-inf", "+inf", withscores=True,
         )
         if not tf_map:
@@ -941,8 +999,8 @@ def dense_search(query: str, top_k: int = HYBRID_DENSE_TOP_K) -> List[Tuple[str,
     qvec  = enc["dense_vecs"][0]
 
     scores: List[Tuple[str, float]] = []
-    for key in redis_vec.scan_iter(f"{CHUNK_PFX}*"):
-        raw_vec = redis_vec.hget(key, "dense_vec")
+    for key in cache_vec.scan_iter(f"{CHUNK_PFX}*"):
+        raw_vec = cache_vec.hget(key, "dense_vec")
         if raw_vec is None:
             continue
         try:
@@ -1017,7 +1075,7 @@ def hybrid_search(
 
     candidate_docs: List[Dict] = []
     for chunk_id, rrf_score in candidates:
-        raw = redis_vec.hgetall(f"{CHUNK_PFX}{chunk_id}")
+        raw = cache_vec.hgetall(f"{CHUNK_PFX}{chunk_id}")
         if not raw:
             continue
         candidate_docs.append({
@@ -1070,7 +1128,7 @@ def ingest_text_document(payload: bytes, s3_key: str, doc_id: str) -> int:
       1. Extract raw text
       2. SemanticSplitterNodeParser → semantic chunks
       3. BGE-M3 dense + sparse embedding (batch)
-      4. Store in Redis Vec DB + BM25 index
+      4. Store in Cache Vec DB + BM25 index
     Returns number of chunks stored.
     """
     filename = os.path.basename(s3_key)
@@ -1219,7 +1277,7 @@ def full_sync_from_s3(force: bool = False) -> Dict:
             results["skipped"] += 1
             continue
 
-        stored_etag = redis_vec.hget(ETAG_KEY, key)
+        stored_etag = cache_vec.hget(ETAG_KEY, key)
         stored_etag_str = stored_etag.decode() if stored_etag else None
         if not force and stored_etag_str == etag:
             print(f"  ⏭️  Unchanged: {key}")
@@ -1229,7 +1287,7 @@ def full_sync_from_s3(force: bool = False) -> Dict:
         delete_doc_chunks(generate_doc_id(key))
         try:
             result = full_ingest_pipeline(key)
-            redis_vec.hset(ETAG_KEY, key, etag)
+            cache_vec.hset(ETAG_KEY, key, etag)
             results["ingested"] += 1
             results["docs"].append(result)
         except Exception as e:
@@ -1343,10 +1401,10 @@ class DeleteRequest(BaseModel):
 @app.get("/")
 def root():
     try:
-        redis_vec.ping()
-        redis_ok = True
+        cache_vec.ping()
+        cache_ok = True
     except Exception:
-        redis_ok = False
+        cache_ok = False
     return {
         "service":    "Multimodal RAG Service v3 (LlamaIndex)",
         "status":     "running",
@@ -1357,7 +1415,7 @@ def root():
         "reranker":   RERANKER_MODEL,
         "retrieval":  "Hybrid (dense KNN + BM25 RRF) + BGE-Reranker-v2-m3",
         "llm":        OLLAMA_MODEL,
-        "redis_ok":   redis_ok,
+        "cache_ok":   cache_ok,
         "s3_bucket":  S3_BUCKET,
         "s3_prefix":  S3_PREFIX,
     }
@@ -1366,7 +1424,7 @@ def root():
 @app.get("/health")
 def health():
     checks: Dict[str, str] = {}
-    for client, label in [(redis_vec, "redis_vec"), (redis_bm25_str, "redis_bm25")]:
+    for client, label in [(cache_vec, "cache_vec"), (cache_bm25_str, "cache_bm25")]:
         try:
             client.ping()
             checks[label] = "ok"
@@ -1436,16 +1494,16 @@ def retrieve(req: RetrieveRequest):
 def delete_document(req: DeleteRequest):
     doc_id  = generate_doc_id(req.s3_key)
     deleted = delete_doc_chunks(doc_id)
-    redis_vec.hdel(ETAG_KEY, req.s3_key)
+    cache_vec.hdel(ETAG_KEY, req.s3_key)
     return {"success": True, "s3_key": req.s3_key, "chunks_deleted": deleted}
 
 
 @app.get("/stats")
 def stats():
     try:
-        doc_count   = redis_vec.scard(DOC_IDX_KEY)
-        chunk_count = sum(1 for _ in redis_vec.scan_iter(f"{CHUNK_PFX}*"))
-        bm25_terms  = sum(1 for _ in redis_bm25_str.scan_iter(f"{BM25_TERM_PFX}*"))
+        doc_count   = cache_vec.scard(DOC_IDX_KEY)
+        chunk_count = sum(1 for _ in cache_vec.scan_iter(f"{CHUNK_PFX}*"))
+        bm25_terms  = sum(1 for _ in cache_bm25_str.scan_iter(f"{BM25_TERM_PFX}*"))
         return {
             "success":          True,
             "framework":        "llama-index SemanticSplitterNodeParser",
@@ -1481,12 +1539,12 @@ async def startup():
     print(f"   Reranker     : {RERANKER_MODEL}")
     print(f"   LLM          : {OLLAMA_MODEL}  via Ollama")
     print(f"   Retrieval    : Hybrid KNN+BM25 RRF → BGE-Reranker-v2-m3")
-    print(f"   Redis RAG    : {REDIS_HOST}:{REDIS_RAG_PORT}"
-          f"  Vec=db{REDIS_VEC_DB}  BM25=db{REDIS_BM25_DB}")
+    print(f"   Cache RAG    : {CACHE_HOST}:{CACHE_RAG_PORT}"
+          f"  Vec=db{CACHE_VEC_DB}  BM25=db{CACHE_BM25_DB}")
     print(f"   S3           : s3://{S3_BUCKET}/{S3_PREFIX}")
     print("=" * 65)
 
-    create_redis_vector_index()
+    create_cache_vector_index()
 
     should_ingest = AUTO_INGEST_ON_STARTUP and (AUTO_INGEST_FORCE or not _has_existing_doc_index())
 
@@ -1535,8 +1593,8 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     print("🛑 RAG Service shutting down")
-    redis_vec.close()
-    redis_bm25_str.close()
+    cache_vec.close()
+    cache_bm25_str.close()
 
 # =========================================================
 # SEMANTIC CHUNKING
